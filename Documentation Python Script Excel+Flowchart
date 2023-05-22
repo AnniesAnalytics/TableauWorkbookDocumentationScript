@@ -1,0 +1,215 @@
+# Import necessary libraries
+import xml.etree.ElementTree as ET
+import os
+import pandas as pd
+import openpyxl
+from openpyxl import Workbook
+from xmltodict import parse
+import graphviz
+
+# main script
+# Define the TableauDocumentation class
+class TableauDocumentation:
+    # Initialize the class with input_path, output_path, and output_filename
+    def __init__(self, input_path, output_path, output_filename):
+        self.input_path = input_path
+        self.output_path = output_path
+        self.output_filename = output_filename
+        # Parse the XML file and store it in a tree structure
+        self.tree = ET.parse(self.input_path)
+        # Get the root element of the tree
+        self.root = self.tree.getroot()
+        # Initialize dictionaries and lists for calculations and parameters
+        self.calc_dict = {}
+        self.calc_list = []
+        self.param_list = []
+
+    # Find the parent element of the given element
+    def find_parent(self, element):
+        for parent in self.root.iter():
+            if element in parent:
+                return parent
+        return None
+
+    # Find the data source caption for a given column element
+    def find_data_source_caption(self, column_element):
+        parent_element = self.find_parent(column_element)
+
+        if parent_element is None:
+            return None
+
+        datasource_element = parent_element.find(".//datasource")
+
+        if datasource_element is not None:
+            datasource_name = datasource_element.get("caption")
+        else:
+            datasource_name = None
+
+        return datasource_name
+
+    # Create a dictionary to store calculated fields
+    def create_calc_dict(self):
+        for item in self.root.findall('.//column[@caption]'):
+            # Skip if the item does not have a calculation
+            if item.find(".//calculation") is None:
+                continue
+            # Skip if the item is a parameter
+            elif 'Parameter' in item.attrib['name']:
+                continue
+            # Add the item to the calc_dict with its name and caption
+            else:
+                self.calc_dict[item.attrib['name']] = '[' + item.attrib['caption'] + ']'
+
+    # Extract calculated fields from the XML tree
+    def extract_calculated_fields(self):
+        self.create_calc_dict()
+        for item in self.root.findall('.//column[@caption]'):
+            if item.find(".//calculation") is None:
+                continue
+            elif 'Parameter' in item.attrib['name']:
+                continue
+            else:
+                if item.find(".//calculation[@formula]") is None:
+                    continue
+                else:
+                    calc_caption = '[' + item.attrib['caption'] + ']'
+                    calc_name = item.attrib['name']
+                    calc_raw_formula = item.find(".//calculation").attrib['formula']
+                    calc_comment = ''
+                    calc_formula = ''
+
+                    # Separate comments and formula from the raw formula
+                    for line in calc_raw_formula.split('\r\n'):
+                        if line.startswith('//'):
+                            calc_comment = calc_comment + line + ' '
+                        else:
+                            calc_formula = calc_formula + line + ' '
+
+                    # Replace field names in the formula with their captions
+                    for name, caption in self.calc_dict.items():
+                        calc_formula = calc_formula.replace(name, caption)
+
+                    # Store the calculated field information as a tuple
+                    calc_row = (calc_caption, calc_name, calc_formula, calc_comment)
+                    self.calc_list.append(list(calc_row))
+                    
+    # Extract parameters from the Tableau XML
+    def extract_parameters(self):
+        # Loop through all columns with a caption attribute in the XML
+        for item in self.root.findall('.//column[@caption]'):
+            # If the column does not have a calculation, skip it
+            if item.find(".//calculation") is None:
+                continue
+            # If the column name does not contain 'Parameter', skip it
+            elif 'Parameter' not in item.attrib['name']:
+                continue
+            else:
+                # Get parameter attributes and values
+                param_alias = item.attrib.get('alias', '')
+                param_caption = item.attrib['caption']
+                param_name = item.attrib['name']
+                param_domain_type = item.attrib.get('param-domain-type', '')
+                param_type = item.attrib['type']
+                param_formula = item.find(".//calculation").attrib.get('formula', '')
+                param_values = [{"key": alias.attrib['key'], "value": alias.attrib['value']} for alias in item.findall(".//alias")]
+
+                # Create a string with the parameter formula values
+                param_formula_values = '\n'.join([f"{param_value['key']}={param_value['value']}" for param_value in param_values])
+
+                # Create a tuple with the extracted parameter information
+                param_row = (param_alias, param_caption, param_name, param_domain_type, param_type, param_formula, param_formula_values)
+                # Append the tuple to the list of parameters
+                self.param_list.append(list(param_row))
+
+    # Find parent fields in the given formula
+    def find_parent_fields(self, formula):
+        parents = set()
+        for name, caption in self.calc_dict.items():
+            if caption in formula:
+                parents.add(caption)
+        return parents
+
+    # Build a relationship tree for the calculated fields
+    def build_relationship_tree(self):
+        relationship_tree = {}
+        for calc_row in self.calc_list:
+            calc_caption, _, calc_formula, _ = calc_row
+            parent_fields = self.find_parent_fields(calc_formula)
+            relationship_tree[calc_caption] = parent_fields
+        return relationship_tree
+
+    # Create a flowchart based on the relationship tree
+    def create_flowchart(self, relationship_tree, output_folder, output_filename, bgcolor):
+        dot = graphviz.Digraph(filename=os.path.join(output_folder, output_filename), format='png', graph_attr={'rankdir': 'LR', 'bgcolor': bgcolor}, node_attr={'style': 'filled', 'fillcolor': 'white'})
+
+        # Add edges between child and parent fields in the relationship tree
+        for child, parents in relationship_tree.items():
+            for parent in parents:
+                dot.edge(parent, child)
+
+        # Render the flowchart
+        dot.render(view=True)
+        
+    # Create documentation for the Tableau workbook
+    def create_documentation(self, bgcolor='#FFFFFF'):
+        # Extract calculated fields and parameters from the XML tree
+        self.extract_calculated_fields()
+        self.extract_parameters()
+
+        # Build a relationship tree for the calculated fields
+        relationship_tree = self.build_relationship_tree()
+
+        # Call the create_flowchart function to create a flowchart from the relationship tree
+        output_folder = self.output_path
+        output_filename = self.output_filename + ".png"
+        self.create_flowchart(relationship_tree, self.output_path, output_filename, bgcolor)
+
+        # Convert the list of calculated fields into a DataFrame
+        data = pd.DataFrame(self.calc_list, columns=['Name', 'Remote Name', 'Formula', 'Comment'])
+        data['Name'] = data['Name'].apply(lambda x: x.strip('[]'))
+        data['Remote Name'] = data['Remote Name'].apply(lambda x: x.strip('[]'))
+        data = data.drop_duplicates(subset=None, keep='first', inplace=False)
+
+        # Convert the list of parameters into a DataFrame
+        param_data = pd.DataFrame(self.param_list, columns=['Aliased Name', 'Name', 'Remote Name', 'Display Type', 'Data Type', 'Value', 'Formula'])
+
+        # Save the DataFrames to an Excel file
+        output_file = os.path.join(self.output_path, self.output_filename) + ".xlsx"
+        writer = pd.ExcelWriter(output_file, engine='xlsxwriter')
+        data.to_excel(writer, sheet_name='Calculated Fields', index=False)
+        param_data.to_excel(writer, sheet_name='Parameters', index=False)
+        writer.save()
+
+        # Open the Excel file and add a new sheet for Tableau Workbook Information
+        workbook = openpyxl.load_workbook(output_file)
+        worksheet = workbook.create_sheet(title='Tableau Workbook Information')
+        
+        # Parse the XML tree and extract workbook data
+        twb_data = parse(ET.tostring(self.root))
+        for datasource in twb_data['workbook']['datasources']['datasource']:
+            worksheet.append([datasource['@name']])
+            worksheet.append(['Name', 'Type', 'Calculation'])
+
+            # Loop through columns in the datasource and add their information to the worksheet
+            for column in datasource['column']:
+                if 'calculation' in column and '@caption' in column['calculation']:
+                    name = column['calculation']['@caption']
+                else:
+                    name = column['@name']
+                datatype = column.get('@datatype', '')
+                calculation = column.get('calculation', {}).get('@formula', '') if 'calculation' in column else ''
+                worksheet.append([name, datatype, calculation])
+
+        # Save and close the Excel workbook
+        workbook.save(output_file)
+        workbook.close()
+        print(f"The output file '{self.output_filename}.xlsx' has been created in the directory '{self.output_path}'")
+   
+# call the script here
+if __name__ == "__main__":
+    input_path = #input here -  If you use / in the path, enclose it in ' '. If you use \ in the path, use the format r"your\path"
+    output_path =  #output folder ex. r"C:\Users\anel\Documents\Python Tests"
+    output_filename = "5.19.documentation" #output file name
+
+    tableau_doc = TableauDocumentation(input_path, output_path, output_filename)
+    tableau_doc.create_documentation(bgcolor='#dde4f2')  # Specify the desired bgcolor here
